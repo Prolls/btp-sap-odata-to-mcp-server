@@ -1081,6 +1081,18 @@ export class HierarchicalSAPToolRegistry {
                 Object.assign(queryOptions, args.queryOptions);
             }
 
+            // Safety net: enforce a default $top on read operations to prevent fetching entire tables
+            const DEFAULT_READ_TOP = 200;
+            if (operation === 'read' && !queryOptions.$top) {
+                this.logger.info(`No $top specified for read operation, defaulting to ${DEFAULT_READ_TOP}`);
+                queryOptions.$top = DEFAULT_READ_TOP;
+            }
+
+            // Always include inline count for read operations so the model knows the total
+            if (operation === 'read' && !queryOptions.$inlinecount) {
+                queryOptions.$inlinecount = 'allpages';
+            }
+
             const useUserToken = args.useUserToken !== false; // Default to true
 
             // Validate service
@@ -1185,6 +1197,18 @@ export class HierarchicalSAPToolRegistry {
             }
 
             let responseText = `SUCCESS: ${operationDescription}\n\n`;
+
+            // For read operations, extract inline count if available and add summary
+            if (operation === 'read') {
+                const data = response.data?.d || response.data;
+                const inlineCount = data?.__count ?? data?.['@odata.count'];
+                const results = data?.results || (Array.isArray(data) ? data : null);
+                if (inlineCount !== undefined) {
+                    const returnedCount = results?.length ?? '?';
+                    responseText += `TOTAL COUNT: ${inlineCount} records (returning ${returnedCount})\n\n`;
+                }
+            }
+
             responseText += `== RESULT ==\n`;
             responseText += JSON.stringify(response.data, null, 2);
 
