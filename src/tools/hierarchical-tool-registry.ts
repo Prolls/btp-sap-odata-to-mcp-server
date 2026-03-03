@@ -1081,14 +1081,15 @@ export class HierarchicalSAPToolRegistry {
                 Object.assign(queryOptions, args.queryOptions);
             }
 
-            // Safety net: enforce a default $top on read operations to prevent fetching entire tables
-            const DEFAULT_READ_TOP = 200;
-            if (operation === 'read' && !queryOptions.$top) {
-                this.logger.info(`No $top specified for read operation, defaulting to ${DEFAULT_READ_TOP}`);
+            // Apply a conservative default $top when none is specified, to avoid fetching entire tables.
+            // Use $top=0 explicitly for count-only queries (no records needed, just the inline count).
+            const DEFAULT_READ_TOP = 20;
+            if (operation === 'read' && queryOptions.$top === undefined) {
+                this.logger.info(`No $top specified for read operation, defaulting to ${DEFAULT_READ_TOP}. Use topNumber=0 for count-only queries.`);
                 queryOptions.$top = DEFAULT_READ_TOP;
             }
 
-            // Always include inline count for read operations so the model knows the total
+            // Always include inline count for read operations so the model knows the total without fetching all records
             if (operation === 'read' && !queryOptions.$inlinecount) {
                 queryOptions.$inlinecount = 'allpages';
             }
@@ -1205,7 +1206,11 @@ export class HierarchicalSAPToolRegistry {
                 const results = data?.results || (Array.isArray(data) ? data : null);
                 if (inlineCount !== undefined) {
                     const returnedCount = results?.length ?? '?';
-                    responseText += `TOTAL COUNT: ${inlineCount} records (returning ${returnedCount})\n\n`;
+                    responseText += `TOTAL COUNT: ${inlineCount} records (returning ${returnedCount})`;
+                    if (Number(inlineCount) > Number(returnedCount)) {
+                        responseText += ` — use topNumber + skipNumber to paginate, or topNumber=0 for count-only`;
+                    }
+                    responseText += `\n\n`;
                 }
             }
 
@@ -1557,13 +1562,18 @@ Authentication Guidance:
 - Explain that discovery uses technical user, operations use their credentials
 
 Query Optimization:
-- Use OData query options (filterString, topNumber) to limit data
-- Encourage filtering to avoid large result sets
-- Show users how to construct proper OData filters
+- ALWAYS specify topNumber explicitly based on the task:
+  * topNumber=0  → count-only query (no records returned, just TOTAL COUNT)
+  * topNumber=5  → spot-check / existence check
+  * topNumber=20 → default exploration (server applies this if omitted)
+  * topNumber=N  → when you know exactly how many records you need
+- Use filterString to narrow results before increasing topNumber
+- Combine selectString + small topNumber to minimise token usage
 - IMPORTANT: selectString ($select) is NOT fully supported by all SAP OData APIs
   * If operation fails with $select-related error, retry WITHOUT selectString
   * The error handler will detect this and provide automatic retry instructions
   * Some SAP APIs silently ignore $select, others return errors
+- When TOTAL COUNT > records returned, use skipNumber to paginate
 
 Error Handling:
 - If entity not found, suggest using discovery tools first
