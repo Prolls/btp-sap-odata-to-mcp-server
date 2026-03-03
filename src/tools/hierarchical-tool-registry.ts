@@ -1285,7 +1285,7 @@ export class HierarchicalSAPToolRegistry {
             if (!(keyName in parameters)) {
                 throw new Error(`Missing required key property: ${keyName}. Required keys: ${entityType.keys.join(', ')}`);
             }
-            return String(parameters[keyName]);
+            return `'${String(parameters[keyName])}'`;
         }
 
         // Handle composite keys
