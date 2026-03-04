@@ -334,6 +334,11 @@ export class HierarchicalSAPToolRegistry {
                     nullable: prop.nullable,
                     maxLength: prop.maxLength,
                     isKey: entityType.keys.includes(prop.name)
+                })),
+                navigationProperties: entityType.navigationProperties.map(nav => ({
+                    name: nav.name,
+                    targetEntityType: nav.type,
+                    multiplicity: nav.multiplicity
                 }))
             };
 
@@ -345,6 +350,13 @@ export class HierarchicalSAPToolRegistry {
             responseText += `  - Use the properties below to construct parameters\n\n`;
             responseText += `Key Properties: [${entityType.keys.join(', ')}]\n`;
             responseText += `Capabilities: creatable=${entityType.creatable}, updatable=${entityType.updatable}, deletable=${entityType.deletable}\n\n`;
+            if (entityType.navigationProperties.length > 0) {
+                responseText += `Navigation Properties (for deep insert or expand):\n`;
+                entityType.navigationProperties.forEach(nav => {
+                    responseText += `  - ${nav.name} → ${nav.type || 'unknown'} (${nav.multiplicity})\n`;
+                });
+                responseText += `\nNOTE: SAP OData V2 only supports ONE level of deep insert. You can include a top-level navigation property (e.g. to_PurchaseReqnItem) in a create body, but you CANNOT nest further navigation properties inside those items. Create nested sub-entities (e.g. account assignments) in a separate step.\n\n`;
+            }
             responseText += `Full Metadata:\n\n`;
             responseText += JSON.stringify(metadata, null, 2);
 
@@ -1130,6 +1142,7 @@ export class HierarchicalSAPToolRegistry {
             // Execute the operation
             let response;
             let operationDescription = "";
+            let strippedNavigationPaths: string[] = [];
 
             switch (operation) {
                 case 'read':
@@ -1152,7 +1165,13 @@ export class HierarchicalSAPToolRegistry {
                         throw new Error(`Entity '${entityName}' does not support create operations`);
                     }
                     operationDescription = `Creating new ${entityName}`;
-                    response = await this.sapClient.createEntity(service.url, entityType.entitySet!, parameters);
+                    {
+                        // SAP OData V2 only supports one level of deep insert.
+                        // Strip navigation properties (to_*) nested within top-level navigation property arrays.
+                        const { cleaned: cleanedParams, stripped } = this.extractNestedNavigationProperties(parameters);
+                        strippedNavigationPaths = stripped;
+                        response = await this.sapClient.createEntity(service.url, entityType.entitySet!, cleanedParams);
+                    }
                     break;
 
                 case 'update':
@@ -1187,6 +1206,15 @@ export class HierarchicalSAPToolRegistry {
             let responseText = `SUCCESS: ${operationDescription}\n\n`;
             responseText += `== RESULT ==\n`;
             responseText += JSON.stringify(response.data, null, 2);
+
+            if (strippedNavigationPaths.length > 0) {
+                responseText += `\n\n⚠️ NOTE: The following nested navigation properties were automatically removed from the request body. SAP OData V2 does not support multi-level deep inserts (navigation properties nested within other navigation properties).\n`;
+                responseText += `You must create these sub-entities separately using individual create operations:\n`;
+                strippedNavigationPaths.forEach(path => {
+                    responseText += `  - ${path}\n`;
+                });
+                responseText += `\nFor example, to create account assignments for a purchase requisition item, use a separate execute-sap-operation call with operation: "create" on the PurReqnAcctAssgmt entity, providing the PurchaseRequisition and PurchaseRequisitionItem key fields from the result above.`;
+            }
 
             return {
                 content: [{
@@ -1248,6 +1276,46 @@ export class HierarchicalSAPToolRegistry {
                 isError: true
             };
         }
+    }
+
+    /**
+     * Extract nested navigation properties from a create request body.
+     * SAP OData V2 supports only one level of deep insert: top-level navigation properties
+     * (e.g. to_PurchaseReqnItem inside PurchaseRequisitionHeader) are kept.
+     * Navigation properties nested within those arrays (e.g. to_PurReqnAcctAssgmt inside an item)
+     * are stripped and their paths recorded for user notification.
+     */
+    private extractNestedNavigationProperties(data: Record<string, unknown>): {
+        cleaned: Record<string, unknown>;
+        stripped: string[];
+    } {
+        const cleaned: Record<string, unknown> = {};
+        const stripped: string[] = [];
+
+        for (const [key, value] of Object.entries(data)) {
+            if (key.startsWith('to_') && Array.isArray(value)) {
+                // Top-level navigation property array — keep it but strip nav props from each item
+                const cleanedItems = value.map((item: unknown, index: number) => {
+                    if (item && typeof item === 'object' && !Array.isArray(item)) {
+                        const cleanedItem: Record<string, unknown> = {};
+                        for (const [itemKey, itemValue] of Object.entries(item as Record<string, unknown>)) {
+                            if (itemKey.startsWith('to_')) {
+                                stripped.push(`${key}[${index}].${itemKey}`);
+                            } else {
+                                cleanedItem[itemKey] = itemValue;
+                            }
+                        }
+                        return cleanedItem;
+                    }
+                    return item;
+                });
+                cleaned[key] = cleanedItems;
+            } else {
+                cleaned[key] = value;
+            }
+        }
+
+        return { cleaned, stripped };
     }
 
     /**

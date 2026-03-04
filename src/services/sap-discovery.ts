@@ -116,7 +116,7 @@ export class SAPDiscoveryService {
 
             const response = await executeHttpRequest(destination, {
                 method: 'GET',
-                url: '/sap/opu/odata/IWFND/CATALOGSERVICE;v=2/ServiceCollection',
+                url: '/sap/opu/odata/IWFND/CATALOGSERVICE;v=2/ServiceCollection?$top=1000',
                 headers: {
                     'Accept': 'application/json'
                 }
@@ -218,7 +218,8 @@ export class SAPDiscoveryService {
         const xmlDoc = dom.window.document;
 
         const entitySets = this.extractEntitySets(xmlDoc);
-        const entityTypes = this.extractEntityTypes(xmlDoc, entitySets);
+        const associations = this.extractAssociations(xmlDoc);
+        const entityTypes = this.extractEntityTypes(xmlDoc, entitySets, associations);
 
         return {
             entityTypes,
@@ -228,7 +229,41 @@ export class SAPDiscoveryService {
         };
     }
 
-    private extractEntityTypes(xmlDoc: Document, entitySets: Array<{ [key: string]: string | boolean | null }>): EntityType[] {
+    /**
+     * Build a map of OData Association definitions used to resolve NavigationProperty targets.
+     * Key: fully-qualified association name (e.g. "ZAPI_PURCHASEREQ_PROCESS.toItem_PurchaseRequisition")
+     * Value: array of End definitions [{type, multiplicity, role}]
+     */
+    private extractAssociations(xmlDoc: Document): Map<string, Array<{ type: string; multiplicity: string; role: string }>> {
+        const map = new Map<string, Array<{ type: string; multiplicity: string; role: string }>>();
+        const namespace = this.extractNamespace(xmlDoc);
+
+        xmlDoc.querySelectorAll("Association").forEach((assocNode: Element) => {
+            const name = assocNode.getAttribute("Name");
+            if (!name) return;
+
+            const ends: Array<{ type: string; multiplicity: string; role: string }> = [];
+            assocNode.querySelectorAll("End").forEach((endNode: Element) => {
+                ends.push({
+                    type: endNode.getAttribute("Type") || '',
+                    multiplicity: endNode.getAttribute("Multiplicity") || '*',
+                    role: endNode.getAttribute("Role") || ''
+                });
+            });
+
+            // Store under both qualified and unqualified names for easy lookup
+            map.set(`${namespace}.${name}`, ends);
+            map.set(name, ends);
+        });
+
+        return map;
+    }
+
+    private extractEntityTypes(
+        xmlDoc: Document,
+        entitySets: Array<{ [key: string]: string | boolean | null }>,
+        associations: Map<string, Array<{ type: string; multiplicity: string; role: string }>>
+    ): EntityType[] {
         const entityTypes: EntityType[] = [];
         const nodes = xmlDoc.querySelectorAll("EntityType");
 
@@ -262,6 +297,28 @@ export class SAPDiscoveryService {
             const keyNodes = node.querySelectorAll("Key PropertyRef");
             keyNodes.forEach((keyNode: Element) => {
                 entityType.keys.push(keyNode.getAttribute("Name") || '');
+            });
+
+            // Extract navigation properties using the association map
+            const navNodes = node.querySelectorAll("NavigationProperty");
+            navNodes.forEach((navNode: Element) => {
+                const navName = navNode.getAttribute("Name") || '';
+                const relationship = navNode.getAttribute("Relationship") || '';
+                const toRole = navNode.getAttribute("ToRole") || '';
+
+                // Resolve target entity type and multiplicity via the association definition
+                const assocEnds = associations.get(relationship);
+                const targetEnd = assocEnds?.find(e => e.role === toRole);
+                const targetTypeFull = targetEnd?.type || '';
+                // Strip namespace prefix: "NAMESPACE.EntityTypeName" → "EntityTypeName"
+                const targetType = targetTypeFull.includes('.') ? targetTypeFull.split('.').pop()! : targetTypeFull;
+                const rawMult = targetEnd?.multiplicity || '*';
+                const multiplicity: '1' | '0..1' | '*' =
+                    rawMult === '1' ? '1' : rawMult === '0..1' ? '0..1' : '*';
+
+                if (navName) {
+                    entityType.navigationProperties.push({ name: navName, type: targetType, multiplicity });
+                }
             });
 
             entityTypes.push(entityType);

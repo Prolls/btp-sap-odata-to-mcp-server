@@ -160,14 +160,78 @@ export class SAPClient {
     }
 
     private handleError(error: unknown): Error {
-        if (
-            typeof error === 'object' &&
-            error !== null &&
-            'rootCause' in error &&
-            (error as { rootCause?: { response?: { status: number; data?: { error?: { message?: string } }; statusText?: string } } }).rootCause?.response
-        ) {
-            const response = (error as { rootCause: { response: { status: number; data?: { error?: { message?: string } }; statusText?: string } } }).rootCause.response;
-            return new Error(`SAP API Error ${response.status}: ${response.data?.error?.message || response.statusText}`);
+        if (typeof error === 'object' && error !== null) {
+            const err = error as Record<string, unknown>;
+
+            // SAP Cloud SDK may wrap the error (rootCause.response)
+            // or the underlying axios error may be thrown directly (response at top level).
+            // Check both to reliably extract the SAP OData error body.
+            const response =
+                (err['rootCause'] as Record<string, unknown> | undefined)?.['response'] as Record<string, unknown> | undefined
+                ?? err['response'] as Record<string, unknown> | undefined;
+
+            if (response) {
+                const status = response['status'];
+                const statusText = response['statusText'];
+
+                // response.data may be a Buffer (if axios didn't auto-parse JSON),
+                // a plain string (JSON not yet parsed), or an already-parsed object.
+                let data: {
+                    error?: {
+                        code?: string;
+                        // SAP OData V2: message is an object {lang, value}, not a plain string
+                        message?: string | { lang?: string; value?: string };
+                        innererror?: {
+                            errordetails?: Array<{
+                                code?: string;
+                                message?: string | { lang?: string; value?: string };
+                                severity?: string;
+                            }>;
+                        };
+                    };
+                } | undefined;
+
+                const rawData = response['data'];
+                if (Buffer.isBuffer(rawData)) {
+                    try { data = JSON.parse(rawData.toString('utf8')); } catch { data = undefined; }
+                } else if (typeof rawData === 'string') {
+                    try { data = JSON.parse(rawData); } catch { data = undefined; }
+                } else {
+                    data = rawData as typeof data;
+                }
+
+                let errorMsg = `SAP API Error ${status}`;
+
+                if (data?.error) {
+                    const errObj = data.error;
+                    const mainMsg = typeof errObj.message === 'string'
+                        ? errObj.message
+                        : errObj.message?.value;
+
+                    if (mainMsg) {
+                        errorMsg += `: ${mainMsg}`;
+                    }
+
+                    // Include all error details from innererror.errordetails
+                    const details = errObj.innererror?.errordetails;
+                    if (details && details.length > 0) {
+                        const detailMsgs = details
+                            .map(d => {
+                                const msg = typeof d.message === 'string' ? d.message : d.message?.value;
+                                return msg ? (d.code ? `[${d.code}] ${msg}` : msg) : null;
+                            })
+                            .filter((m): m is string => m !== null);
+                        if (detailMsgs.length > 0) {
+                            errorMsg += `\nDetails:\n${detailMsgs.join('\n')}`;
+                        }
+                    }
+                } else {
+                    errorMsg += `: ${statusText}`;
+                }
+
+                this.logger.error(`SAP error extracted: ${errorMsg}`);
+                return new Error(errorMsg);
+            }
         }
         return error instanceof Error ? error : new Error(String(error));
     }
