@@ -91,6 +91,24 @@ export class SAPClient {
         }
     }
 
+    async countEntitySet(servicePath: string, entitySet: string, filter?: string): Promise<number> {
+        let url = `${servicePath}${entitySet}/$count`;
+        if (filter) {
+            url += `?$filter=${encodeURIComponent(filter)}`;
+        }
+        const response = await this.executeRequest({
+            method: 'GET',
+            url,
+            isDiscovery: false,
+            headers: { 'Accept': 'text/plain' }
+        });
+        const count = parseInt(String(response.data), 10);
+        if (isNaN(count)) {
+            throw new Error(`Unexpected /$count response: ${JSON.stringify(response.data)}`);
+        }
+        return count;
+    }
+
     async readEntitySet(servicePath: string, entitySet: string, queryOptions?: {
         $filter?: string;
         $select?: string;

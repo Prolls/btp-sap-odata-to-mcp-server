@@ -94,7 +94,7 @@ export class HierarchicalSAPToolRegistry {
                 inputSchema: {
                     serviceId: z.string().describe("The SAP service ID from discover-sap-data. IMPORTANT: Use the 'id' field from the search results, NOT the 'title' field."),
                     entityName: z.string().describe("The entity name from discover-sap-data. IMPORTANT: Use the 'name' field from the results, NOT the 'entitySet' field."),
-                    operation: z.string().describe("The operation to perform. Valid values: read, read-single, create, update, delete"),
+                    operation: z.string().describe("The operation to perform. Valid values: read, read-single, count, create, update, delete. Use 'count' to get the total number of records (optionally filtered) without fetching any data — much faster and token-efficient than read."),
                     parameters: z.record(z.any()).optional().describe("Operation parameters such as keys, filters, and data. For read-single/update/delete operations, include the entity key properties. For create/update operations, include the entity data fields."),
                     filterString: z.string().optional().describe("OData $filter query option value. Use OData filter syntax without the '$filter=' prefix. Examples: \"Status eq 'Active'\", \"Amount gt 1000\", \"Name eq 'John' and Status eq 'Active'\". Common operators: eq (equals), ne (not equals), gt (greater than), lt (less than), ge (greater/equal), le (less/equal), and, or, not."),
                     selectString: z.string().optional().describe("OData $select query option value. Comma-separated list of property names to include in the response, without the '$select=' prefix. Example: \"Name,Status,CreatedDate\" or \"CustomerID,CustomerName\". WARNING: Not all SAP OData APIs fully support $select. If the operation fails with a $select-related error, retry WITHOUT this parameter to get all properties."),
@@ -1062,7 +1062,7 @@ export class HierarchicalSAPToolRegistry {
             const parameters = args.parameters as Record<string, unknown> || {};
 
             // Validate operation for better Copilot compatibility
-            const validOperations = ["read", "read-single", "create", "update", "delete"];
+            const validOperations = ["read", "read-single", "count", "create", "update", "delete"];
             if (!validOperations.includes(operation)) {
                 throw new Error(`Invalid operation: ${operation}. Valid operations are: ${validOperations.join(', ')}`);
             }
@@ -1145,6 +1145,19 @@ export class HierarchicalSAPToolRegistry {
             let operationDescription = "";
 
             switch (operation) {
+                case 'count': {
+                    const countFilter = queryOptions.$filter as string | undefined;
+                    operationDescription = `Counting ${entityName} entities`;
+                    if (countFilter) operationDescription += ` with filter: ${countFilter}`;
+                    const totalCount = await this.sapClient.countEntitySet(service.url, entityType.entitySet!, countFilter);
+                    return {
+                        content: [{
+                            type: "text" as const,
+                            text: `SUCCESS: ${operationDescription}\n\nTOTAL COUNT: ${totalCount} records`
+                        }]
+                    };
+                }
+
                 case 'read':
                     operationDescription = `Reading ${entityName} entities`;
                     if (queryOptions.$top) operationDescription += ` (top ${queryOptions.$top})`;
