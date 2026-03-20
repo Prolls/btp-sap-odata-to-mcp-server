@@ -196,10 +196,18 @@ export class HierarchicalSAPToolRegistry {
             // Try to find matches
             matches = this.performMinimalSearch(query, category);
 
-            // If no matches found, return ALL services with minimal data
+            // If all matched services are unavailable (entityCount: 0), treat as no useful results
+            const usableMatches = matches.filter(m => m.service.entityCount > 0);
+            if (matches.length > 0 && usableMatches.length === 0 && query) {
+                this.logger.debug(`Query '${query}' matched services but all have METADATA_UNAVAILABLE — returning all available services`);
+                matches = this.performMinimalSearch("", category).filter(m => m.service.entityCount > 0);
+                returnedAllServices = true;
+            }
+
+            // If no matches found, return ALL services with minimal data (excluding unavailable)
             if (matches.length === 0 && query) {
                 this.logger.debug(`No results found for query '${query}', returning all available services (minimal)`);
-                matches = this.performMinimalSearch("", category);
+                matches = this.performMinimalSearch("", category).filter(m => m.service.entityCount > 0);
                 returnedAllServices = true;
             }
 
@@ -232,7 +240,7 @@ export class HierarchicalSAPToolRegistry {
             let responseText = "";
 
             if (returnedAllServices) {
-                responseText += `[LEVEL 1 - NO MATCHES] No results found for "${query}". Returning ALL available services and entities.\n\n`;
+                responseText += `[LEVEL 1 - NO MATCHES] No usable results found for "${query}" (matched services have unavailable metadata). Returning ALL available services and entities.\n\n`;
             } else if (query) {
                 responseText += `[LEVEL 1 - SEARCH RESULTS] Found ${totalFound} matches for "${query}"\n\n`;
             } else {
@@ -433,6 +441,7 @@ export class HierarchicalSAPToolRegistry {
                 const entities = service.metadata?.entityTypes?.map(entity => ({
                     entityName: entity.name
                 })) || [];
+                const isAvailable = entities.length > 0;
 
                 matches.push({
                     type: "service",
@@ -441,6 +450,7 @@ export class HierarchicalSAPToolRegistry {
                         serviceId: service.id,
                         serviceName: service.title,
                         entityCount: entities.length,
+                        status: isAvailable ? "AVAILABLE" : "METADATA_UNAVAILABLE",
                         categories: this.serviceCategories.get(service.id) || []
                     },
                     entities: entities,
