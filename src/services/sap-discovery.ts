@@ -5,7 +5,6 @@ import { Config } from '../utils/config.js';
 import { ODataService, EntityType, ServiceMetadata } from '../types/sap-types.js';
 
 import { JSDOM } from 'jsdom';
-import { tr } from 'zod/v4/locales';
 
 export class SAPDiscoveryService {
     private catalogEndpoints = [
@@ -214,7 +213,7 @@ export class SAPDiscoveryService {
     }
 
     private parseMetadata(metadataXml: string, odataVersion: string): ServiceMetadata {
-        const dom = new JSDOM(metadataXml);
+        const dom = new JSDOM(metadataXml, { contentType: 'text/xml' });
         const xmlDoc = dom.window.document;
 
         const entitySets = this.extractEntitySets(xmlDoc);
@@ -333,7 +332,10 @@ export class SAPDiscoveryService {
 
     nodes.forEach((node: Element) => {
             const entityset: { [key: string]: string | boolean | null } = {};
-            ['name','entitytype', 'sap:creatable', 'sap:updatable', 'sap:deletable', 'sap:pageable', 'sap:addressable', 'sap:content-version'].forEach(attr => {
+            // getAttribute is case-sensitive in XML mode — use exact attribute names from EDMX
+            entityset['name'] = node.getAttribute('Name');
+            entityset['entitytype'] = node.getAttribute('EntityType');
+            ['sap:creatable', 'sap:updatable', 'sap:deletable', 'sap:pageable', 'sap:addressable', 'sap:content-version'].forEach(attr => {
                 const [namespace, name ] = attr.split(":");
                 entityset[name||namespace] = node.getAttribute(attr);
             });

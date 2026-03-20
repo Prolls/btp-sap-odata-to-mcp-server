@@ -65,6 +65,7 @@ export class SAPClient {
             method: options.method,
             url: options.url,
             data: options.data,
+            timeout: 30000,
             headers: {
                 'Content-Type': 'application/json',
                 'Accept': 'application/json',
@@ -88,6 +89,24 @@ export class SAPClient {
             this.logger.error(`Request failed:`, error);
             throw this.handleError(error);
         }
+    }
+
+    async countEntitySet(servicePath: string, entitySet: string, filter?: string): Promise<number> {
+        let url = `${servicePath}${entitySet}/$count`;
+        if (filter) {
+            url += `?$filter=${encodeURIComponent(filter)}`;
+        }
+        const response = await this.executeRequest({
+            method: 'GET',
+            url,
+            isDiscovery: false,
+            headers: { 'Accept': 'text/plain' }
+        });
+        const count = parseInt(String(response.data), 10);
+        if (isNaN(count)) {
+            throw new Error(`Unexpected /$count response: ${JSON.stringify(response.data)}`);
+        }
+        return count;
     }
 
     async readEntitySet(servicePath: string, entitySet: string, queryOptions?: {
@@ -121,7 +140,7 @@ export class SAPClient {
     }
 
     async readEntity(servicePath: string, entitySet: string, key: string, isDiscovery = false) {
-        const url = `${servicePath}${entitySet}('${key}')`;
+        const url = `${servicePath}${entitySet}(${key})`;
 
         return this.executeRequest({
             method: 'GET',
@@ -132,31 +151,67 @@ export class SAPClient {
 
     async createEntity(servicePath: string, entitySet: string, data: unknown) {
         const url = `${servicePath}${entitySet}`;
+        const { token, cookies } = await this.fetchCsrfToken(await this.getExecutionDestination(), servicePath);
 
         return this.executeRequest({
             method: 'POST',
             url,
-            data
+            data,
+            headers: { 'X-CSRF-Token': token, ...(cookies ? { 'Cookie': cookies } : {}) }
         });
     }
 
     async updateEntity(servicePath: string, entitySet: string, key: string, data: unknown) {
-        const url = `${servicePath}${entitySet}('${key}')`;
+        const url = `${servicePath}${entitySet}(${key})`;
+        const { token, cookies } = await this.fetchCsrfToken(await this.getExecutionDestination(), servicePath);
 
         return this.executeRequest({
             method: 'PATCH',
             url,
-            data
+            data,
+            headers: { 'X-CSRF-Token': token, ...(cookies ? { 'Cookie': cookies } : {}) }
         });
     }
 
     async deleteEntity(servicePath: string, entitySet: string, key: string) {
-        const url = `${servicePath}${entitySet}('${key}')`;
+        const url = `${servicePath}${entitySet}(${key})`;
+        const { token, cookies } = await this.fetchCsrfToken(await this.getExecutionDestination(), servicePath);
 
         return this.executeRequest({
             method: 'DELETE',
-            url
+            url,
+            headers: { 'X-CSRF-Token': token, ...(cookies ? { 'Cookie': cookies } : {}) }
         });
+    }
+
+    private async fetchCsrfToken(destination: HttpDestination, servicePath: string): Promise<{ token: string; cookies: string }> {
+        try {
+            this.logger.debug(`Fetching CSRF token from ${servicePath}`);
+            const response = await executeHttpRequest(destination as HttpDestination, {
+                method: 'GET',
+                url: servicePath,
+                timeout: 30000,
+                headers: {
+                    'X-CSRF-Token': 'Fetch',
+                    'Accept': 'application/json'
+                }
+            });
+            const token = response.headers['x-csrf-token'];
+            this.logger.debug(`CSRF token response: status=${response.status}, token=${token ? token.toString().substring(0, 20) + '...' : 'MISSING'}`);
+            if (!token) {
+                throw new Error('No X-CSRF-Token returned by the server');
+            }
+            // Capture session cookies so the PATCH uses the same SAP session as the token fetch
+            const setCookie = response.headers['set-cookie'];
+            const cookies = Array.isArray(setCookie)
+                ? setCookie.map((c: string) => c.split(';')[0]).join('; ')
+                : (setCookie ? (setCookie as string).split(';')[0] : '');
+            this.logger.debug(`Session cookies captured: ${cookies ? cookies.substring(0, 60) + '...' : 'NONE'}`);
+            return { token: token as string, cookies };
+        } catch (error) {
+            this.logger.error('Failed to fetch CSRF token:', error);
+            throw error;
+        }
     }
 
     private handleError(error: unknown): Error {

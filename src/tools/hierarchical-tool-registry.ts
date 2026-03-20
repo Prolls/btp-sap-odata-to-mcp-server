@@ -94,7 +94,7 @@ export class HierarchicalSAPToolRegistry {
                 inputSchema: {
                     serviceId: z.string().describe("The SAP service ID from discover-sap-data. IMPORTANT: Use the 'id' field from the search results, NOT the 'title' field."),
                     entityName: z.string().describe("The entity name from discover-sap-data. IMPORTANT: Use the 'name' field from the results, NOT the 'entitySet' field."),
-                    operation: z.string().describe("The operation to perform. Valid values: read, read-single, create, update, delete"),
+                    operation: z.string().describe("The operation to perform. Valid values: read, read-single, count, create, update, delete. Use 'count' to get the total number of records (optionally filtered) without fetching any data — much faster and token-efficient than read."),
                     parameters: z.record(z.any()).optional().describe("Operation parameters such as keys, filters, and data. For read-single/update/delete operations, include the entity key properties. For create/update operations, include the entity data fields."),
                     filterString: z.string().optional().describe("OData $filter query option value. Use OData filter syntax without the '$filter=' prefix. Examples: \"Status eq 'Active'\", \"Amount gt 1000\", \"Name eq 'John' and Status eq 'Active'\". Common operators: eq (equals), ne (not equals), gt (greater than), lt (less than), ge (greater/equal), le (less/equal), and, or, not."),
                     selectString: z.string().optional().describe("OData $select query option value. Comma-separated list of property names to include in the response, without the '$select=' prefix. Example: \"Name,Status,CreatedDate\" or \"CustomerID,CustomerName\". WARNING: Not all SAP OData APIs fully support $select. If the operation fails with a $select-related error, retry WITHOUT this parameter to get all properties."),
@@ -384,6 +384,18 @@ export class HierarchicalSAPToolRegistry {
      * Returns only essential fields: serviceId, serviceName, entityName
      * Optimized for LLM token efficiency
      */
+    /**
+     * Match text against a query: supports both combined ("purchaseorder")
+     * and separated multi-word ("purchase order") matching.
+     */
+    private matchesQueryMinimal(text: string, query: string): boolean {
+        if (!query) return false;
+        if (text.includes(query)) return true;
+        // Multi-word: all words must appear in text
+        const words = query.split(/\s+/).filter(w => w.length > 1);
+        return words.length > 1 && words.every(w => text.includes(w));
+    }
+
     private performMinimalSearch(query: string, category: string): Array<{
         type: 'service' | 'entity';
         score: number;
@@ -393,37 +405,30 @@ export class HierarchicalSAPToolRegistry {
             entityCount: number;
             categories: string[];
         };
-        entities?: Array<{
-            entityName: string;
-        }>;
-        entity?: {
-            entityName: string;
-        };
+        entities?: Array<{ entityName: string }>;
+        entity?: { entityName: string };
         matchReason?: string;
     }> {
         const matches: Array<any> = [];
 
-        // Search across all services
         for (const service of this.discoveredServices) {
-            // Filter by category first
             if (category !== "all") {
                 const serviceCategories = this.serviceCategories.get(service.id) || [];
-                if (!serviceCategories.includes(category)) {
-                    continue;
-                }
+                if (!serviceCategories.includes(category)) continue;
             }
 
             const serviceIdLower = service.id.toLowerCase();
             const serviceTitleLower = service.title.toLowerCase();
+            const serviceDescLower = service.description.toLowerCase();
 
-            // Service-level match
+            // Service-level match — check id, title, description with multi-word support
             let serviceScore = 0;
             if (query) {
-                if (serviceIdLower.includes(query)) serviceScore = 0.9;
-                else if (serviceTitleLower.includes(query)) serviceScore = 0.85;
+                if (this.matchesQueryMinimal(serviceIdLower, query)) serviceScore = 0.9;
+                else if (this.matchesQueryMinimal(serviceTitleLower, query)) serviceScore = 0.85;
+                else if (this.matchesQueryMinimal(serviceDescLower, query)) serviceScore = 0.7;
             }
 
-            // If service matches or no query, include service with minimal entity list
             if (serviceScore > 0 || !query) {
                 const entities = service.metadata?.entityTypes?.map(entity => ({
                     entityName: entity.name
@@ -443,13 +448,10 @@ export class HierarchicalSAPToolRegistry {
                 });
             }
 
-            // Entity-level matches within this service (only if query provided)
+            // Entity-level matches (only if query provided)
             if (service.metadata?.entityTypes && query) {
                 for (const entity of service.metadata.entityTypes) {
-                    const entityNameLower = entity.name.toLowerCase();
-
-                    // Match entity name
-                    if (entityNameLower.includes(query)) {
+                    if (this.matchesQueryMinimal(entity.name.toLowerCase(), query)) {
                         matches.push({
                             type: "entity",
                             score: 0.95,
@@ -459,9 +461,7 @@ export class HierarchicalSAPToolRegistry {
                                 entityCount: service.metadata.entityTypes.length,
                                 categories: this.serviceCategories.get(service.id) || []
                             },
-                            entity: {
-                                entityName: entity.name
-                            },
+                            entity: { entityName: entity.name },
                             matchReason: `Entity '${entity.name}' matches '${query}'`
                         });
                     }
@@ -1074,7 +1074,7 @@ export class HierarchicalSAPToolRegistry {
             const parameters = args.parameters as Record<string, unknown> || {};
 
             // Validate operation for better Copilot compatibility
-            const validOperations = ["read", "read-single", "create", "update", "delete"];
+            const validOperations = ["read", "read-single", "count", "create", "update", "delete"];
             if (!validOperations.includes(operation)) {
                 throw new Error(`Invalid operation: ${operation}. Valid operations are: ${validOperations.join(', ')}`);
             }
@@ -1091,6 +1091,19 @@ export class HierarchicalSAPToolRegistry {
             // Also support legacy queryOptions object for backward compatibility
             if (args.queryOptions && typeof args.queryOptions === 'object') {
                 Object.assign(queryOptions, args.queryOptions);
+            }
+
+            // Apply a conservative default $top when none is specified, to avoid fetching entire tables.
+            // Use $top=0 explicitly for count-only queries (no records needed, just the inline count).
+            const DEFAULT_READ_TOP = 20;
+            if (operation === 'read' && queryOptions.$top === undefined) {
+                this.logger.info(`No $top specified for read operation, defaulting to ${DEFAULT_READ_TOP}. Use topNumber=0 for count-only queries.`);
+                queryOptions.$top = DEFAULT_READ_TOP;
+            }
+
+            // Always include inline count for read operations so the model knows the total without fetching all records
+            if (operation === 'read' && !queryOptions.$inlinecount) {
+                queryOptions.$inlinecount = 'allpages';
             }
 
             const useUserToken = args.useUserToken !== false; // Default to true
@@ -1145,6 +1158,19 @@ export class HierarchicalSAPToolRegistry {
             let strippedNavigationPaths: string[] = [];
 
             switch (operation) {
+                case 'count': {
+                    const countFilter = queryOptions.$filter as string | undefined;
+                    operationDescription = `Counting ${entityName} entities`;
+                    if (countFilter) operationDescription += ` with filter: ${countFilter}`;
+                    const totalCount = await this.sapClient.countEntitySet(service.url, entityType.entitySet!, countFilter);
+                    return {
+                        content: [{
+                            type: "text" as const,
+                            text: `SUCCESS: ${operationDescription}\n\nTOTAL COUNT: ${totalCount} records`
+                        }]
+                    };
+                }
+
                 case 'read':
                     operationDescription = `Reading ${entityName} entities`;
                     if (queryOptions.$top) operationDescription += ` (top ${queryOptions.$top})`;
@@ -1204,6 +1230,22 @@ export class HierarchicalSAPToolRegistry {
             }
 
             let responseText = `SUCCESS: ${operationDescription}\n\n`;
+
+            // For read operations, extract inline count if available and add summary
+            if (operation === 'read') {
+                const data = response.data?.d || response.data;
+                const inlineCount = data?.__count ?? data?.['@odata.count'];
+                const results = data?.results || (Array.isArray(data) ? data : null);
+                if (inlineCount !== undefined) {
+                    const returnedCount = results?.length ?? '?';
+                    responseText += `TOTAL COUNT: ${inlineCount} records (returning ${returnedCount})`;
+                    if (Number(inlineCount) > Number(returnedCount)) {
+                        responseText += ` — use topNumber + skipNumber to paginate, or topNumber=0 for count-only`;
+                    }
+                    responseText += `\n\n`;
+                }
+            }
+
             responseText += `== RESULT ==\n`;
             responseText += JSON.stringify(response.data, null, 2);
 
@@ -1329,7 +1371,7 @@ export class HierarchicalSAPToolRegistry {
             if (!(keyName in parameters)) {
                 throw new Error(`Missing required key property: ${keyName}. Required keys: ${entityType.keys.join(', ')}`);
             }
-            return String(parameters[keyName]);
+            return `'${String(parameters[keyName])}'`;
         }
 
         // Handle composite keys
@@ -1601,13 +1643,18 @@ Authentication Guidance:
 - Explain that discovery uses technical user, operations use their credentials
 
 Query Optimization:
-- Use OData query options (filterString, topNumber) to limit data
-- Encourage filtering to avoid large result sets
-- Show users how to construct proper OData filters
+- ALWAYS specify topNumber explicitly based on the task:
+  * topNumber=0  → count-only query (no records returned, just TOTAL COUNT)
+  * topNumber=5  → spot-check / existence check
+  * topNumber=20 → default exploration (server applies this if omitted)
+  * topNumber=N  → when you know exactly how many records you need
+- Use filterString to narrow results before increasing topNumber
+- Combine selectString + small topNumber to minimise token usage
 - IMPORTANT: selectString ($select) is NOT fully supported by all SAP OData APIs
   * If operation fails with $select-related error, retry WITHOUT selectString
   * The error handler will detect this and provide automatic retry instructions
   * Some SAP APIs silently ignore $select, others return errors
+- When TOTAL COUNT > records returned, use skipNumber to paginate
 
 Error Handling:
 - If entity not found, suggest using discovery tools first
