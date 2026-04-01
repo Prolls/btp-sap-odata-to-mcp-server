@@ -61,7 +61,7 @@ export class HierarchicalSAPToolRegistry {
                 inputSchema: {
                     query: z.string().optional().describe("Search term to find services or entities. Searches service names, entity names. Examples: 'customer', 'sales order', 'employee'. If omitted or no matches found, returns ALL services with their entities (minimal fields only)."),
                     category: z.string().optional().describe("Service category filter. Valid values: business-partner, sales, finance, procurement, hr, logistics, all. Default: all. Narrows search to specific business area."),
-                    limit: z.number().min(1).max(50).optional().describe("Maximum number of results. Default: 20. Use higher limits when returning all services.")
+                    limit: z.number().min(1).max(this.discoveredServices.length || 200).optional().describe(`Maximum number of results. Default: 20. Use ${this.discoveredServices.length} to retrieve all available services.`)
                 }
             },
             async (args: Record<string, unknown>) => {
