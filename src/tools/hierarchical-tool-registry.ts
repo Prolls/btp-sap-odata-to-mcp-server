@@ -196,19 +196,29 @@ export class HierarchicalSAPToolRegistry {
             // Try to find matches
             matches = this.performMinimalSearch(query, category);
 
-            // If all matched services are unavailable (entityCount: 0), treat as no useful results
+            // If all matched services are unavailable (entityCount: 0), fall back to all services
             const usableMatches = matches.filter(m => m.service.entityCount > 0);
             if (matches.length > 0 && usableMatches.length === 0 && query) {
-                this.logger.debug(`Query '${query}' matched services but all have METADATA_UNAVAILABLE — returning all available services`);
-                matches = this.performMinimalSearch("", category).filter(m => m.service.entityCount > 0);
+                this.logger.debug(`Query '${query}' matched services but all have METADATA_UNAVAILABLE — returning all services`);
+                matches = this.performMinimalSearch("", category);
                 returnedAllServices = true;
             }
 
-            // If no matches found, return ALL services with minimal data (excluding unavailable)
+            // If no matches found, return ALL services with minimal data
             if (matches.length === 0 && query) {
                 this.logger.debug(`No results found for query '${query}', returning all available services (minimal)`);
-                matches = this.performMinimalSearch("", category).filter(m => m.service.entityCount > 0);
+                matches = this.performMinimalSearch("", category);
                 returnedAllServices = true;
+            }
+
+            // Sort: AVAILABLE services first, METADATA_UNAVAILABLE last
+            if (returnedAllServices) {
+                matches.sort((a, b) => {
+                    const aAvail = a.service.entityCount > 0 ? 0 : 1;
+                    const bAvail = b.service.entityCount > 0 ? 0 : 1;
+                    if (aAvail !== bAvail) return aAvail - bAvail;
+                    return a.service.serviceName.localeCompare(b.service.serviceName);
+                });
             }
 
             // Sort by relevance score (if searching) or alphabetically (if returning all)
