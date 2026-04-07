@@ -60,11 +60,12 @@ export class HierarchicalSAPToolRegistry {
             "discover-sap-data",
             {
                 title: "Level 1: Discover SAP Services and Entities",
-                description: "[LEVEL 1 - DISCOVERY] Search for SAP services and entities. Returns MINIMAL data (serviceId, serviceName, entityName) optimized for LLM decision making. If query matches, returns relevant results. If NO matches found, returns ALL available services with entities. After this call, use get-entity-metadata (Level 2) to get full schema details for your selected entity. Uses technical user (no auth needed).",
+                description: "[LEVEL 1 - DISCOVERY] Search for SAP services and entities. Returns MINIMAL data (serviceId, serviceName, entityName) optimized for LLM decision making. If query matches, returns relevant results. If NO matches found, returns ALL available services with entities. By default, call get-entity-metadata (Level 2) next to get full schema — OR use includeSchema:true when your query is precise to get the schema in one call. Uses technical user (no auth needed).",
                 inputSchema: {
                     query: z.string().optional().describe("Search term to find services or entities. Searches service names, entity names. Examples: 'customer', 'sales order', 'employee'. If omitted or no matches found, returns ALL services with their entities (minimal fields only)."),
                     category: z.string().optional().describe("Service category filter. Valid values: business-partner, sales, finance, procurement, hr, logistics, all. Default: all. Narrows search to specific business area."),
-                    limit: z.number().min(1).max(this.discoveredServices.length || 200).optional().describe(`Maximum number of results. Default: 20. Use ${this.discoveredServices.length} to retrieve all available services.`)
+                    limit: z.number().min(1).max(this.discoveredServices.length || 200).optional().describe(`Maximum number of results. Default: 20. Use ${this.discoveredServices.length} to retrieve all available services.`),
+                    includeSchema: z.boolean().optional().describe("Include full entity schemas (properties, types, keys, capabilities) directly in Level 1 results. Only applied when the total number of matched entities is ≤ 5 to avoid context bloat. Default: false. Use true when your query is precise and you want to skip the get-entity-metadata call.")
                 }
             },
             async (args: Record<string, unknown>) => {
@@ -93,7 +94,7 @@ export class HierarchicalSAPToolRegistry {
             "execute-sap-operation",
             {
                 title: "Level 3: Execute SAP Operation",
-                description: "[LEVEL 3 - EXECUTION] AUTHENTICATION REQUIRED: Perform CRUD operations on SAP entities using authenticated user context. Requires valid JWT token for authorization. Use get-entity-metadata (Level 2) first to understand entity schema, then call this to execute operations. Operations execute under user's SAP identity with full audit trail.",
+                description: "[LEVEL 3 - EXECUTION] AUTHENTICATION REQUIRED: Perform CRUD operations on SAP entities using authenticated user context. Requires valid JWT token for authorization. Operations execute under user's SAP identity with full audit trail. When to call Level 2 first: REQUIRED for create/update/delete and filtered reads (need property names and key fields). OPTIONAL for simple read operations (top N without filter) — you can call this directly after discover-sap-data in that case.",
                 inputSchema: {
                     serviceId: z.string().describe("The SAP service ID from discover-sap-data. IMPORTANT: Use the 'id' field from the search results, NOT the 'title' field."),
                     entityName: z.string().describe("The entity name from discover-sap-data. IMPORTANT: Use the 'name' field from the results, NOT the 'entitySet' field."),
@@ -188,6 +189,7 @@ export class HierarchicalSAPToolRegistry {
             const query = (args.query as string)?.toLowerCase() || "";
             const requestedCategory = (args.category as string)?.toLowerCase() || "all";
             const limit = (args.limit as number) || 20;
+            const includeSchema = args.includeSchema === true;
 
             // Validate category
             const validCategories = ["business-partner", "sales", "finance", "procurement", "hr", "logistics", "all"];
@@ -240,12 +242,64 @@ export class HierarchicalSAPToolRegistry {
             const totalFound = matches.length;
             const limitedMatches = matches.slice(0, limit);
 
+            // Count total entities in the result set to decide whether schema inclusion is safe
+            let totalEntityCount = 0;
+            for (const match of limitedMatches) {
+                if (match.type === 'entity') {
+                    totalEntityCount += 1;
+                } else if (match.type === 'service') {
+                    totalEntityCount += (match.entities?.length || 0);
+                }
+            }
+
+            const SCHEMA_INCLUSION_THRESHOLD = 5;
+            const schemaIncluded = includeSchema && totalEntityCount <= SCHEMA_INCLUSION_THRESHOLD;
+            const schemaSkippedDueToSize = includeSchema && !schemaIncluded;
+
+            // Enrich matches with full schemas when safe to do so
+            if (schemaIncluded) {
+                for (const match of limitedMatches) {
+                    const service = this.discoveredServices.find(s => s.id === match.service.serviceId);
+                    if (!service?.metadata?.entityTypes) continue;
+
+                    const buildSchema = (entityName: string) => {
+                        const entity = service.metadata!.entityTypes!.find(e => e.name === entityName);
+                        if (!entity) return undefined;
+                        return {
+                            keyProperties: entity.keys,
+                            capabilities: {
+                                creatable: entity.creatable,
+                                updatable: entity.updatable,
+                                deletable: entity.deletable
+                            },
+                            properties: entity.properties.map(p => ({
+                                name: p.name,
+                                type: p.type,
+                                nullable: p.nullable,
+                                maxLength: p.maxLength,
+                                isKey: entity.keys.includes(p.name)
+                            }))
+                        };
+                    };
+
+                    if (match.type === 'entity' && match.entity) {
+                        match.entity.schema = buildSchema(match.entity.entityName);
+                    } else if (match.type === 'service' && match.entities) {
+                        match.entities = match.entities.map((e: { entityName: string }) => ({
+                            ...e,
+                            schema: buildSchema(e.entityName)
+                        }));
+                    }
+                }
+            }
+
             const result = {
                 query: query || "all",
                 category: category,
                 returnedAllServices: returnedAllServices,
                 totalFound: totalFound,
                 showing: limitedMatches.length,
+                schemaIncluded: schemaIncluded,
                 matches: limitedMatches
             };
 
@@ -260,8 +314,18 @@ export class HierarchicalSAPToolRegistry {
                 responseText += `[LEVEL 1 - ALL SERVICES] Showing all available services and entities\n\n`;
             }
 
-            responseText += `NEXT STEP: Select a service and entity from the results below, then call get-entity-metadata\n`;
-            responseText += `  with the serviceId and entityName to get full schema details.\n\n`;
+            if (schemaIncluded) {
+                responseText += `✅ SCHEMA INCLUDED: Full entity schemas are in the results below (${totalEntityCount} entities ≤ threshold of ${SCHEMA_INCLUSION_THRESHOLD}).\n`;
+                responseText += `NEXT STEP: You can call execute-sap-operation directly — no need to call get-entity-metadata.\n\n`;
+            } else if (schemaSkippedDueToSize) {
+                responseText += `⚠️ SCHEMA NOT INCLUDED: includeSchema was requested but ${totalEntityCount} entities exceed the threshold of ${SCHEMA_INCLUSION_THRESHOLD}.\n`;
+                responseText += `Narrow your query to ≤ ${SCHEMA_INCLUSION_THRESHOLD} entities, or call get-entity-metadata for the specific entity you need.\n\n`;
+            } else {
+                responseText += `NEXT STEP: Select a service and entity from the results below, then either:\n`;
+                responseText += `  - Call get-entity-metadata (serviceId, entityName) to get the full schema before write operations\n`;
+                responseText += `  - Call execute-sap-operation directly for a simple read (no schema needed)\n\n`;
+            }
+
             responseText += `Results (showing ${limitedMatches.length} of ${totalFound}):\n\n`;
             responseText += JSON.stringify(result, null, 2);
 
@@ -1678,8 +1742,10 @@ LEVEL 1: discover-sap-data (LIGHTWEIGHT DISCOVERY)
   - query (optional): Search term for services/entities
   - category (optional): Filter by business area (business-partner, sales, finance, etc.)
   - limit (optional): Maximum results (default: 20)
+  - includeSchema (optional): Include full entity schemas when ≤ 5 entities matched. Default: false.
 - Examples:
   - { query: "customer" } → Returns list of services/entities matching "customer"
+  - { query: "BankAccount", includeSchema: true } → Returns schema directly if ≤ 5 entities matched
   - { query: "" } → Returns all available services with their entities
 - Use this: When you need to find or explore what's available
 
@@ -1689,33 +1755,38 @@ LEVEL 2: get-entity-metadata (FULL SCHEMA DETAILS)
 - Parameters:
   - serviceId (required): From Level 1 results
   - entityName (required): From Level 1 results
-- Use this: After selecting service/entity from Level 1, before executing operations
-- Provides all details needed to construct proper CRUD operations
+- Use this: When you need property names and key fields for write operations or filtered reads
+- Can be skipped for simple read operations (see workflows below)
 
 LEVEL 3: execute-sap-operation (AUTHENTICATED EXECUTION)
 - Purpose: Perform CRUD operations on entities
 - Parameters: serviceId, entityName, operation, parameters, OData options
-- Operations: read, read-single, create, update, delete
+- Operations: read, read-single, create, update, delete, count
 - Requires: User authentication (JWT token)
-- Use this: After getting schema from Level 2 to execute actual operations
+- Level 2 REQUIRED before this for: create, update, delete, read-single, filtered reads
+- Level 2 OPTIONAL for: simple read (top N, no filter) — can call directly after Level 1
 
-== RECOMMENDED WORKFLOW ==
+== RECOMMENDED WORKFLOWS ==
 
-✅ CORRECT 3-Level Workflow:
-1. discover-sap-data → Find relevant services/entities (minimal data)
-2. get-entity-metadata → Get full schema for selected entity
-3. execute-sap-operation → Execute operation using schema from step 2
+Choose the workflow that fits the task:
 
-Benefits of 3-Level Approach:
-- Token Efficient: Level 1 returns minimal data for decision making
-- Progressive Detail: Only fetch full schemas when needed (Level 2)
-- Clear Separation: Discovery → Metadata → Execution
-- Better for LLMs: Smaller responses, clearer workflow
+✅ FAST WORKFLOW — Simple read (2 steps, no schema needed):
+1. discover-sap-data { query: "X" } → get serviceId + entityName
+2. execute-sap-operation { operation: "read", topNumber: 10 } → execute directly
 
-⚠️ IMPORTANT: Do NOT skip Level 2!
-- Level 1 gives you entity names to choose from
-- Level 2 gives you the schema details needed for operations
-- Level 3 executes with proper parameters from Level 2
+✅ SINGLE-PASS WORKFLOW — Precise query, any operation (2 steps, schema in Level 1):
+1. discover-sap-data { query: "X", includeSchema: true } → schema included if ≤ 5 entities matched
+2. execute-sap-operation → execute immediately using schema from step 1
+
+✅ FULL WORKFLOW — Write operations or complex reads (3 steps):
+1. discover-sap-data { query: "X" } → get serviceId + entityName
+2. get-entity-metadata { serviceId, entityName } → get full schema (property names, keys, capabilities)
+3. execute-sap-operation → execute with correct parameters from step 2
+
+Decision guide:
+- User says "show me some X data" → FAST workflow
+- User says "find the X with key Y" or "update X" or "create X" → FULL workflow
+- Query is very specific (single known entity) → SINGLE-PASS workflow
 
 == BEST PRACTICES ==
 
