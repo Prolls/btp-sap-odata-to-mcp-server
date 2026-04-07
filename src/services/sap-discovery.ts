@@ -26,14 +26,13 @@ export class SAPDiscoveryService {
             const filterConfig = this.config.getServiceFilterConfig();
             this.logger.info('OData service discovery configuration:', filterConfig);
 
-            // // Try OData V4 catalog first
-            // const v4Services = await this.discoverV4Services();
-            // services.push(...v4Services);
+            // Try OData V4 catalog first
+            const v4Services = await this.discoverV4Services();
+            services.push(...v4Services);
 
-            // Fallback to V2 service discovery
-            // if (services.length === 0) {
-                const v2Services = await this.discoverV2Services();
-                services.push(...v2Services);
+            // Also discover V2 services
+            const v2Services = await this.discoverV2Services();
+            services.push(...v2Services);
 
                 
             // Apply service filtering based on configuration
@@ -212,10 +211,29 @@ export class SAPDiscoveryService {
         }
     }
 
-    private parseMetadata(metadataXml: string, odataVersion: string): ServiceMetadata {
+    private detectODataVersion(metadataXml: string): 'v2' | 'v4' {
+        // OData v4 metadata uses Version="4.0" on the Edmx root element
+        if (metadataXml.includes('Version="4.0"') || metadataXml.includes("Version='4.0'")) {
+            return 'v4';
+        }
+        return 'v2';
+    }
+
+    private parseMetadata(metadataXml: string, hintVersion: string): ServiceMetadata {
+        const detectedVersion = this.detectODataVersion(metadataXml);
+        // Trust the detected version from the actual XML over the catalog hint
+        const odataVersion = detectedVersion;
+
         const dom = new JSDOM(metadataXml, { contentType: 'text/xml' });
         const xmlDoc = dom.window.document;
 
+        if (odataVersion === 'v4') {
+            return this.parseMetadataV4(xmlDoc);
+        }
+        return this.parseMetadataV2(xmlDoc);
+    }
+
+    private parseMetadataV2(xmlDoc: Document): ServiceMetadata {
         const entitySets = this.extractEntitySets(xmlDoc);
         const associations = this.extractAssociations(xmlDoc);
         const entityTypes = this.extractEntityTypes(xmlDoc, entitySets, associations);
@@ -225,7 +243,7 @@ export class SAPDiscoveryService {
             entityTypes,
             entitySets,
             functionImports,
-            version: odataVersion,
+            version: 'v2',
             namespace: this.extractNamespace(xmlDoc)
         };
     }
@@ -258,6 +276,128 @@ export class SAPDiscoveryService {
         });
 
         return map;
+    }
+
+    private parseMetadataV4(xmlDoc: Document): ServiceMetadata {
+        const entityTypes = this.extractEntityTypesV4(xmlDoc);
+        const functionImports = this.extractFunctionImportsV4(xmlDoc);
+
+        return {
+            entityTypes,
+            entitySets: [],   // v4 uses EntityContainer/EntitySet — represented via entityTypes
+            functionImports,
+            version: 'v4',
+            namespace: this.extractNamespace(xmlDoc)
+        };
+    }
+
+    private extractEntityTypesV4(xmlDoc: Document): EntityType[] {
+        const entityTypes: EntityType[] = [];
+
+        // Build EntitySet map from EntityContainer
+        const entitySetMap = new Map<string, { name: string; insertable: boolean; updatable: boolean; deletable: boolean }>();
+        xmlDoc.querySelectorAll('EntityContainer EntitySet').forEach((node: Element) => {
+            const setName = node.getAttribute('Name') || '';
+            const entityTypeFQN = node.getAttribute('EntityType') || '';
+            // Resolve short name from fully qualified name (e.g. "Namespace.Customer" → "Customer")
+            const shortName = entityTypeFQN.includes('.') ? entityTypeFQN.split('.').pop()! : entityTypeFQN;
+
+            // v4 capabilities via Annotations (Org.OData.Capabilities.V1)
+            let insertable = true;
+            let updatable = true;
+            let deletable = true;
+
+            node.querySelectorAll('Annotation').forEach((ann: Element) => {
+                const term = ann.getAttribute('Term') || '';
+                const boolVal = ann.getAttribute('Bool');
+                const record = ann.querySelector('Record PropertyValue[Property="Insertable"], Record PropertyValue[Property="Updatable"], Record PropertyValue[Property="Deletable"]');
+
+                if (term.includes('InsertRestrictions')) {
+                    const pv = ann.querySelector('Record PropertyValue[Property="Insertable"]');
+                    if (pv) insertable = pv.getAttribute('Bool') !== 'false';
+                    else if (boolVal) insertable = boolVal !== 'false';
+                }
+                if (term.includes('UpdateRestrictions')) {
+                    const pv = ann.querySelector('Record PropertyValue[Property="Updatable"]');
+                    if (pv) updatable = pv.getAttribute('Bool') !== 'false';
+                    else if (boolVal) updatable = boolVal !== 'false';
+                }
+                if (term.includes('DeleteRestrictions')) {
+                    const pv = ann.querySelector('Record PropertyValue[Property="Deletable"]');
+                    if (pv) deletable = pv.getAttribute('Bool') !== 'false';
+                    else if (boolVal) deletable = boolVal !== 'false';
+                }
+            });
+
+            entitySetMap.set(shortName, { name: setName, insertable, updatable, deletable });
+        });
+
+        xmlDoc.querySelectorAll('EntityType').forEach((node: Element) => {
+            const typeName = node.getAttribute('Name') || '';
+            const setInfo = entitySetMap.get(typeName);
+
+            const entityType: EntityType = {
+                name: typeName,
+                namespace: node.parentElement?.getAttribute('Namespace') || '',
+                entitySet: setInfo?.name ?? typeName + 'Set',
+                creatable: setInfo?.insertable ?? true,
+                updatable: setInfo?.updatable ?? true,
+                deletable: setInfo?.deletable ?? true,
+                addressable: true,
+                properties: [],
+                navigationProperties: [],
+                keys: []
+            };
+
+            // Extract properties (v4 has same Property element structure)
+            node.querySelectorAll('Property').forEach((propNode: Element) => {
+                entityType.properties.push({
+                    name: propNode.getAttribute('Name') || '',
+                    type: propNode.getAttribute('Type') || '',
+                    nullable: propNode.getAttribute('Nullable') !== 'false',
+                    maxLength: propNode.getAttribute('MaxLength') ?? undefined
+                });
+            });
+
+            // Extract keys
+            node.querySelectorAll('Key PropertyRef').forEach((keyNode: Element) => {
+                entityType.keys.push(keyNode.getAttribute('Name') || '');
+            });
+
+            entityTypes.push(entityType);
+        });
+
+        return entityTypes;
+    }
+
+    private extractFunctionImportsV4(xmlDoc: Document): FunctionImport[] {
+        const functionImports: FunctionImport[] = [];
+
+        // v4: Actions (POST) and Functions (GET) inside Schema
+        xmlDoc.querySelectorAll('Action, Function').forEach((node: Element) => {
+            const name = node.getAttribute('Name');
+            if (!name) return;
+            const isAction = node.tagName === 'Action' || node.nodeName === 'Action';
+            const httpMethod: 'GET' | 'POST' = isAction ? 'POST' : 'GET';
+            const returnTypeNode = node.querySelector('ReturnType');
+            const returnType = returnTypeNode?.getAttribute('Type') || undefined;
+
+            const parameters: FunctionParameter[] = [];
+            node.querySelectorAll('Parameter').forEach((paramNode: Element) => {
+                const paramName = paramNode.getAttribute('Name');
+                if (!paramName || paramName === 'bindingParameter') return; // skip binding param
+                parameters.push({
+                    name: paramName,
+                    type: paramNode.getAttribute('Type') || 'Edm.String',
+                    mode: 'In',
+                    nullable: paramNode.getAttribute('Nullable') !== 'false'
+                });
+            });
+
+            functionImports.push({ name, httpMethod, returnType, parameters });
+        });
+
+        return functionImports;
     }
 
     private extractFunctionImports(xmlDoc: Document): FunctionImport[] {
