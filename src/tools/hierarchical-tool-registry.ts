@@ -1,6 +1,7 @@
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SAPClient } from "../services/sap-client.js";
 import { Logger } from "../utils/logger.js";
+import { Config } from "../utils/config.js";
 import { ODataService, EntityType } from "../types/sap-types.js";
 import { z } from "zod";
 
@@ -27,6 +28,7 @@ import { z } from "zod";
 export class HierarchicalSAPToolRegistry {
     private serviceCategories = new Map<string, string[]>();
     private userToken?: string;
+    private config: Config;
 
     constructor(
         private mcpServer: McpServer,
@@ -34,6 +36,7 @@ export class HierarchicalSAPToolRegistry {
         private logger: Logger,
         private discoveredServices: ODataService[]
     ) {
+        this.config = new Config();
         this.categorizeServices();
     }
 
@@ -1251,23 +1254,82 @@ export class HierarchicalSAPToolRegistry {
 
             let responseText = `SUCCESS: ${operationDescription}\n\n`;
 
-            // For read operations, extract inline count if available and add summary
+            // For read operations: apply item cap, pagination hints, and size warning
             if (operation === 'read') {
+                const maxItems = this.config.getMaxResponseItems();
+                const maxBytes = this.config.getMaxResponseBytes();
+
                 const data = response.data?.d || response.data;
                 const inlineCount = data?.__count ?? data?.['@odata.count'];
-                const results = data?.results || (Array.isArray(data) ? data : null);
-                if (inlineCount !== undefined) {
-                    const returnedCount = results?.length ?? '?';
-                    responseText += `TOTAL COUNT: ${inlineCount} records (returning ${returnedCount})`;
-                    if (Number(inlineCount) > Number(returnedCount)) {
-                        responseText += ` — use topNumber + skipNumber to paginate, or topNumber=0 for count-only`;
-                    }
-                    responseText += `\n\n`;
-                }
-            }
+                let results: unknown[] | null = data?.results || (Array.isArray(data) ? data : null);
+                const currentSkip = (args.skipNumber as number) || 0;
+                const currentTop = (args.topNumber as number) || 20;
 
-            responseText += `== RESULT ==\n`;
-            responseText += JSON.stringify(response.data, null, 2);
+                // Apply hard item cap
+                let truncated = false;
+                if (results && results.length > maxItems) {
+                    results = results.slice(0, maxItems);
+                    truncated = true;
+                    // Patch the response so JSON.stringify reflects the truncation
+                    if (response.data?.d?.results) {
+                        response.data.d.results = results;
+                    } else if (response.data?.results) {
+                        response.data.results = results;
+                    } else if (Array.isArray(response.data)) {
+                        response.data = results;
+                    }
+                }
+
+                const returnedCount = results?.length ?? '?';
+                const totalCount = inlineCount !== undefined ? Number(inlineCount) : null;
+
+                // Summary line
+                if (totalCount !== null) {
+                    responseText += `TOTAL COUNT: ${totalCount} records`;
+                    responseText += ` (returning ${returnedCount}`;
+                    if (truncated) responseText += `, capped at MAX_RESPONSE_ITEMS=${maxItems}`;
+                    responseText += `)\n`;
+                } else {
+                    responseText += `RETURNED: ${returnedCount} records\n`;
+                }
+
+                // Pagination hints
+                const effectiveReturned = Number(returnedCount);
+                const hasMore = totalCount !== null
+                    ? currentSkip + effectiveReturned < totalCount
+                    : truncated;
+
+                if (hasMore) {
+                    const nextSkip = currentSkip + effectiveReturned;
+                    responseText += `PAGINATION: More records available.\n`;
+                    responseText += `  → Next page: skipNumber=${nextSkip}, topNumber=${currentTop}\n`;
+                    if (totalCount !== null) {
+                        const remaining = totalCount - nextSkip;
+                        responseText += `  → Remaining: ~${remaining} records\n`;
+                    }
+                    responseText += `  → For count only (no records): operation="count"\n`;
+                }
+                responseText += `\n`;
+
+                // Serialize and check size
+                const serialized = JSON.stringify(response.data, null, 2);
+                const sizeBytes = Buffer.byteLength(serialized, 'utf8');
+
+                if (sizeBytes > maxBytes) {
+                    const sizeKb = Math.round(sizeBytes / 1024);
+                    const limitKb = Math.round(maxBytes / 1024);
+                    responseText += `⚠️ LARGE RESPONSE: ~${sizeKb}KB (limit ${limitKb}KB). Consider:\n`;
+                    responseText += `  - Adding selectString to return only needed properties\n`;
+                    responseText += `  - Reducing topNumber\n`;
+                    responseText += `  - Adding filterString to narrow results\n\n`;
+                }
+
+                responseText += `== RESULT ==\n`;
+                responseText += serialized;
+            } else {
+                responseText += `== RESULT ==\n`;
+                responseText += JSON.stringify(response.data, null, 2);
+            }
 
             if (strippedNavigationPaths.length > 0) {
                 responseText += `\n\n⚠️ NOTE: The following nested navigation properties were automatically removed from the request body. SAP OData V2 does not support multi-level deep inserts (navigation properties nested within other navigation properties).\n`;
