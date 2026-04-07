@@ -179,6 +179,39 @@ export class SAPClient {
         });
     }
 
+    async callFunction(
+        servicePath: string,
+        functionName: string,
+        parameters: Record<string, unknown>,
+        httpMethod: 'GET' | 'POST'
+    ) {
+        if (httpMethod === 'POST') {
+            const url = `${servicePath}${functionName}`;
+            const { token, cookies } = await this.fetchCsrfToken(await this.getExecutionDestination(), servicePath);
+            return this.executeRequest({
+                method: 'POST',
+                url,
+                data: parameters,
+                headers: { 'X-CSRF-Token': token, ...(cookies ? { 'Cookie': cookies } : {}) }
+            });
+        }
+
+        // GET: serialize parameters as OData-typed query string values
+        let url = `${servicePath}${functionName}`;
+        if (Object.keys(parameters).length > 0) {
+            const params = new URLSearchParams();
+            Object.entries(parameters).forEach(([key, value]) => {
+                if (value !== undefined && value !== null) {
+                    // Wrap strings in single quotes as per OData v2 literal syntax
+                    const serialized = typeof value === 'string' ? `'${value}'` : String(value);
+                    params.set(key, serialized);
+                }
+            });
+            url += `?${params.toString()}`;
+        }
+        return this.executeRequest({ method: 'GET', url, isDiscovery: false });
+    }
+
     async deleteEntity(servicePath: string, entitySet: string, key: string) {
         const url = `${servicePath}${entitySet}(${key})`;
         const { token, cookies } = await this.fetchCsrfToken(await this.getExecutionDestination(), servicePath);

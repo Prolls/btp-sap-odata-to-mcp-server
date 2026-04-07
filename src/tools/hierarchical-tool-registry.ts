@@ -59,10 +59,10 @@ export class HierarchicalSAPToolRegistry {
         this.mcpServer.registerTool(
             "discover-sap-data",
             {
-                title: "Level 1: Discover SAP Services and Entities",
-                description: "[LEVEL 1 - DISCOVERY] Search for SAP services and entities. Returns MINIMAL data (serviceId, serviceName, entityName) optimized for LLM decision making. If query matches, returns relevant results. If NO matches found, returns ALL available services with entities. By default, call get-entity-metadata (Level 2) next to get full schema — OR use includeSchema:true when your query is precise to get the schema in one call. Uses technical user (no auth needed).",
+                title: "Level 1: Discover SAP Services, Entities and Functions",
+                description: "[LEVEL 1 - DISCOVERY] Search for SAP services, entities, and function imports. Returns MINIMAL data (serviceId, serviceName, entityName, functionName) optimized for LLM decision making. If query matches, returns relevant results. If NO matches found, returns ALL available services with entities and functions. By default, call get-entity-metadata (Level 2) next to get full schema — OR use includeSchema:true when your query is precise to get the schema in one call. Uses technical user (no auth needed).",
                 inputSchema: {
-                    query: z.string().optional().describe("Search term to find services or entities. Searches service names, entity names. Examples: 'customer', 'sales order', 'employee'. If omitted or no matches found, returns ALL services with their entities (minimal fields only)."),
+                    query: z.string().optional().describe("Search term to find services, entities, or function imports. Examples: 'customer', 'GetNextPO', 'activate'. If omitted or no matches found, returns ALL services with their entities and functions (minimal fields only)."),
                     category: z.string().optional().describe("Service category filter. Valid values: business-partner, sales, finance, procurement, hr, logistics, all. Default: all. Narrows search to specific business area."),
                     limit: z.number().min(1).max(this.discoveredServices.length || 200).optional().describe(`Maximum number of results. Default: 20. Use ${this.discoveredServices.length} to retrieve all available services.`),
                     includeSchema: z.boolean().optional().describe("Include full entity schemas (properties, types, keys, capabilities) directly in Level 1 results. Only applied when the total number of matched entities is ≤ 5 to avoid context bloat. Default: false. Use true when your query is precise and you want to skip the get-entity-metadata call.")
@@ -98,8 +98,8 @@ export class HierarchicalSAPToolRegistry {
                 inputSchema: {
                     serviceId: z.string().describe("The SAP service ID from discover-sap-data. IMPORTANT: Use the 'id' field from the search results, NOT the 'title' field."),
                     entityName: z.string().describe("The entity name from discover-sap-data. IMPORTANT: Use the 'name' field from the results, NOT the 'entitySet' field."),
-                    operation: z.string().describe("The operation to perform. Valid values: read, read-single, count, create, update, delete. Use 'count' to get the total number of records (optionally filtered) without fetching any data — much faster and token-efficient than read."),
-                    parameters: z.record(z.any()).optional().describe("Operation parameters such as keys, filters, and data. For read-single/update/delete operations, include the entity key properties. For create/update operations, include the entity data fields."),
+                    operation: z.string().describe("The operation to perform. Valid values: read, read-single, count, create, update, delete, function. Use 'count' to get the total number of records without fetching data. Use 'function' to call an OData Function Import — set entityName to the function name and parameters to the function input parameters."),
+                    parameters: z.record(z.any()).optional().describe("Operation parameters such as keys, filters, and data. For read-single/update/delete: include entity key properties. For create/update: include entity data fields. For function: include function input parameters (use get-entity-metadata to get parameter names and types)."),
                     filterString: z.string().optional().describe("OData $filter query option value. Use OData filter syntax without the '$filter=' prefix. Examples: \"Status eq 'Active'\", \"Amount gt 1000\", \"Name eq 'John' and Status eq 'Active'\". Common operators: eq (equals), ne (not equals), gt (greater than), lt (less than), ge (greater/equal), le (less/equal), and, or, not."),
                     selectString: z.string().optional().describe("OData $select query option value. Comma-separated list of property names to include in the response, without the '$select=' prefix. Example: \"Name,Status,CreatedDate\" or \"CustomerID,CustomerName\". WARNING: Not all SAP OData APIs fully support $select. If the operation fails with a $select-related error, retry WITHOUT this parameter to get all properties."),
                     expandString: z.string().optional().describe("OData $expand query option value. Comma-separated list of navigation properties to expand, without the '$expand=' prefix. Example: \"Customer,Items\" or \"OrderDetails\"."),
@@ -379,14 +379,40 @@ export class HierarchicalSAPToolRegistry {
                 };
             }
 
+            // Check if it's a function import first
+            const functionImport = service.metadata?.functionImports?.find(f => f.name === entityName);
+            if (functionImport) {
+                const metadata = {
+                    service: { serviceId: service.id, serviceName: service.title, odataVersion: service.odataVersion },
+                    function: {
+                        name: functionImport.name,
+                        httpMethod: functionImport.httpMethod,
+                        returnType: functionImport.returnType || 'void',
+                        parameters: functionImport.parameters
+                    }
+                };
+                let responseText = `[LEVEL 2 - FUNCTION METADATA] Schema for function '${entityName}' in ${service.title}\n\n`;
+                responseText += `NEXT STEP: Use execute-sap-operation with:\n`;
+                responseText += `  - serviceId: "${serviceId}"\n`;
+                responseText += `  - entityName: "${entityName}"\n`;
+                responseText += `  - operation: "function"\n`;
+                responseText += `  - parameters: { ${functionImport.parameters.filter(p => p.mode !== 'Out').map(p => `"${p.name}": <${p.type}>`).join(', ')} }\n\n`;
+                responseText += `HTTP Method: ${functionImport.httpMethod}\n`;
+                responseText += `Return Type: ${functionImport.returnType || 'void'}\n\n`;
+                responseText += `Full Metadata:\n\n`;
+                responseText += JSON.stringify(metadata, null, 2);
+                return { content: [{ type: "text" as const, text: responseText }] };
+            }
+
             // Find the entity
             const entityType = service.metadata?.entityTypes?.find(e => e.name === entityName);
             if (!entityType) {
                 const availableEntities = service.metadata?.entityTypes?.map(e => e.name).join(', ') || 'none';
+                const availableFunctions = service.metadata?.functionImports?.map(f => f.name).join(', ') || 'none';
                 return {
                     content: [{
                         type: "text" as const,
-                        text: `ERROR: Entity '${entityName}' not found in service '${serviceId}'\n\nAvailable entities: ${availableEntities}`
+                        text: `ERROR: '${entityName}' not found in service '${serviceId}'\n\nAvailable entities: ${availableEntities}\nAvailable functions: ${availableFunctions}`
                     }],
                     isError: true
                 };
@@ -514,11 +540,17 @@ export class HierarchicalSAPToolRegistry {
                 else if (this.matchesQueryMinimal(serviceDescLower, query)) serviceScore = 0.7;
             }
 
+            // If service matches or no query, include service with minimal entity + function list
             if (serviceScore > 0 || !query) {
                 const entities = service.metadata?.entityTypes?.map(entity => ({
                     entityName: entity.name
                 })) || [];
-                const isAvailable = entities.length > 0;
+                const functions = service.metadata?.functionImports?.map(fn => ({
+                    functionName: fn.name,
+                    httpMethod: fn.httpMethod,
+                    returnType: fn.returnType
+                })) || [];
+                const isAvailable = entities.length > 0 || functions.length > 0;
 
                 matches.push({
                     type: "service",
@@ -527,17 +559,19 @@ export class HierarchicalSAPToolRegistry {
                         serviceId: service.id,
                         serviceName: service.title,
                         entityCount: entities.length,
+                        functionCount: functions.length,
                         status: isAvailable ? "AVAILABLE" : "METADATA_UNAVAILABLE",
                         categories: this.serviceCategories.get(service.id) || []
                     },
-                    entities: entities,
+                    entities,
+                    functions,
                     matchReason: serviceScore > 0 ? `Service matches '${query}'` : `Service in category '${category}'`
                 });
             }
 
-            // Entity-level matches (only if query provided)
-            if (service.metadata?.entityTypes && query) {
-                for (const entity of service.metadata.entityTypes) {
+            // Entity-level and function-level matches (only if query provided)
+            if (query) {
+                for (const entity of (service.metadata?.entityTypes || [])) {
                     if (this.matchesQueryMinimal(entity.name.toLowerCase(), query)) {
                         matches.push({
                             type: "entity",
@@ -545,11 +579,31 @@ export class HierarchicalSAPToolRegistry {
                             service: {
                                 serviceId: service.id,
                                 serviceName: service.title,
-                                entityCount: service.metadata.entityTypes.length,
+                                entityCount: service.metadata?.entityTypes?.length || 0,
                                 categories: this.serviceCategories.get(service.id) || []
                             },
                             entity: { entityName: entity.name },
                             matchReason: `Entity '${entity.name}' matches '${query}'`
+                        });
+                    }
+                }
+                for (const fn of (service.metadata?.functionImports || [])) {
+                    if (fn.name.toLowerCase().includes(query)) {
+                        matches.push({
+                            type: "function",
+                            score: 0.95,
+                            service: {
+                                serviceId: service.id,
+                                serviceName: service.title,
+                                categories: this.serviceCategories.get(service.id) || []
+                            },
+                            function: {
+                                functionName: fn.name,
+                                httpMethod: fn.httpMethod,
+                                returnType: fn.returnType,
+                                parameterCount: fn.parameters.length
+                            },
+                            matchReason: `Function '${fn.name}' matches '${query}'`
                         });
                     }
                 }
@@ -1161,7 +1215,7 @@ export class HierarchicalSAPToolRegistry {
             const parameters = args.parameters as Record<string, unknown> || {};
 
             // Validate operation for better Copilot compatibility
-            const validOperations = ["read", "read-single", "count", "create", "update", "delete"];
+            const validOperations = ["read", "read-single", "count", "create", "update", "delete", "function"];
             if (!validOperations.includes(operation)) {
                 throw new Error(`Invalid operation: ${operation}. Valid operations are: ${validOperations.join(', ')}`);
             }
@@ -1217,6 +1271,35 @@ export class HierarchicalSAPToolRegistry {
                         text: errorMessage
                     }],
                     isError: true
+                };
+            }
+
+            // For function operations, validate against functionImports instead of entityTypes
+            if (operation === 'function') {
+                const functionImport = service.metadata?.functionImports?.find(f => f.name === entityName);
+                if (!functionImport) {
+                    const availableFunctions = service.metadata?.functionImports?.map(f => f.name).join(', ') || 'none';
+                    return {
+                        content: [{
+                            type: "text" as const,
+                            text: `ERROR: Function '${entityName}' not found in service '${serviceId}'\n\nAvailable functions: ${availableFunctions}\nUse discover-sap-data to find function names.`
+                        }],
+                        isError: true
+                    };
+                }
+                if (useUserToken && this.userToken) this.sapClient.setUserToken(this.userToken);
+                else this.sapClient.setUserToken(undefined);
+
+                const operationDescription = `Calling function '${entityName}' (${functionImport.httpMethod})`;
+                this.logger.info(operationDescription);
+                const response = await this.sapClient.callFunction(
+                    service.url, functionImport.name, parameters, functionImport.httpMethod
+                );
+                return {
+                    content: [{
+                        type: "text" as const,
+                        text: `SUCCESS: ${operationDescription}\n\n== RESULT ==\n${JSON.stringify(response.data, null, 2)}`
+                    }]
                 };
             }
 

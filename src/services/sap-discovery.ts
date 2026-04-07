@@ -2,7 +2,7 @@ import { executeHttpRequest } from '@sap-cloud-sdk/http-client';
 import { SAPClient } from './sap-client.js';
 import { Logger } from '../utils/logger.js';
 import { Config } from '../utils/config.js';
-import { ODataService, EntityType, ServiceMetadata } from '../types/sap-types.js';
+import { ODataService, EntityType, ServiceMetadata, FunctionImport, FunctionParameter } from '../types/sap-types.js';
 
 import { JSDOM } from 'jsdom';
 
@@ -219,10 +219,12 @@ export class SAPDiscoveryService {
         const entitySets = this.extractEntitySets(xmlDoc);
         const associations = this.extractAssociations(xmlDoc);
         const entityTypes = this.extractEntityTypes(xmlDoc, entitySets, associations);
+        const functionImports = this.extractFunctionImports(xmlDoc);
 
         return {
             entityTypes,
             entitySets,
+            functionImports,
             version: odataVersion,
             namespace: this.extractNamespace(xmlDoc)
         };
@@ -256,6 +258,45 @@ export class SAPDiscoveryService {
         });
 
         return map;
+    }
+
+    private extractFunctionImports(xmlDoc: Document): FunctionImport[] {
+        const functionImports: FunctionImport[] = [];
+        const nodes = xmlDoc.querySelectorAll('FunctionImport');
+
+        nodes.forEach((node: Element) => {
+            const name = node.getAttribute('Name');
+            if (!name) return;
+
+            // m:HttpMethod attribute — try prefixed and un-prefixed forms
+            const httpMethodRaw =
+                node.getAttribute('m:HttpMethod') ||
+                node.getAttributeNS('http://schemas.microsoft.com/ado/2007/08/dataservices/metadata', 'HttpMethod') ||
+                'GET';
+            const httpMethod: 'GET' | 'POST' =
+                httpMethodRaw.toUpperCase() === 'POST' ? 'POST' : 'GET';
+
+            const returnType = node.getAttribute('ReturnType') || undefined;
+
+            const parameters: FunctionParameter[] = [];
+            node.querySelectorAll('Parameter').forEach((paramNode: Element) => {
+                const paramName = paramNode.getAttribute('Name');
+                if (!paramName) return;
+                const modeRaw = paramNode.getAttribute('Mode') || 'In';
+                const mode: 'In' | 'Out' | 'InOut' =
+                    modeRaw === 'Out' ? 'Out' : modeRaw === 'InOut' ? 'InOut' : 'In';
+                parameters.push({
+                    name: paramName,
+                    type: paramNode.getAttribute('Type') || 'Edm.String',
+                    mode,
+                    nullable: paramNode.getAttribute('Nullable') !== 'false'
+                });
+            });
+
+            functionImports.push({ name, httpMethod, returnType, parameters });
+        });
+
+        return functionImports;
     }
 
     private extractEntityTypes(
