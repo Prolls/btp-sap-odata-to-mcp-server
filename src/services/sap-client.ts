@@ -3,6 +3,7 @@ import { HttpDestination } from '@sap-cloud-sdk/connectivity';
 import { DestinationService } from './destination-service.js';
 import { Logger } from '../utils/logger.js';
 import { Config } from '../utils/config.js';
+import { convertSapDatesInResponse, isDateConversionEnabled } from '../utils/odata-date.js';
 
 
 export class SAPClient {
@@ -83,6 +84,11 @@ export class SAPClient {
             const response = await executeHttpRequest(destination as HttpDestination, requestOptions);
 
             this.logger.debug(`Request completed successfully`);
+
+            if (isDateConversionEnabled() && response.data) {
+                response.data = convertSapDatesInResponse(response.data);
+            }
+
             return response;
 
         } catch (error) {
