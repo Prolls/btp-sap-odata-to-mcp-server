@@ -1346,7 +1346,7 @@ export class HierarchicalSAPToolRegistry {
                     if (queryOptions.$top) operationDescription += ` (top ${queryOptions.$top})`;
                     if (queryOptions.$filter) operationDescription += ` with filter: ${queryOptions.$filter}`;
 
-                    response = await this.sapClient.readEntitySet(service.url, entityType.entitySet!, queryOptions, false);
+                    response = await this.sapClient.readEntitySet(service.url, entityType.entitySet!, queryOptions, false, service.odataVersion);
                     break;
 
                 case 'read-single': {
@@ -1406,8 +1406,9 @@ export class HierarchicalSAPToolRegistry {
                 const maxItems = this.config.getMaxResponseItems();
                 const maxBytes = this.config.getMaxResponseBytes();
 
+                // Handle both v2 envelope (d.results / d.__count) and v4 envelope (value / @odata.count)
                 const data = response.data?.d || response.data;
-                const inlineCount = data?.__count ?? data?.['@odata.count'];
+                const inlineCount = data?.__count ?? data?.['@odata.count'] ?? response.data?.['@odata.count'];
                 let results: unknown[] | null = data?.results || (Array.isArray(data) ? data : null);
                 const currentSkip = (args.skipNumber as number) || 0;
                 const currentTop = (args.topNumber as number) || 20;

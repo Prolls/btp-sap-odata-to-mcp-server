@@ -115,19 +115,19 @@ export class SAPClient {
         return count;
     }
 
-    async readEntitySet(servicePath: string, entitySet: string, queryOptions?: {
-        $filter?: string;
-        $select?: string;
-        $expand?: string;
-        $orderby?: string;
-        $top?: number;
-        $skip?: number;
-    }, isDiscovery = false) {
+    async readEntitySet(servicePath: string, entitySet: string, queryOptions?: Record<string, unknown>, isDiscovery = false, odataVersion: 'v2' | 'v4' = 'v2') {
         let url = `${servicePath}${entitySet}`;
 
         if (queryOptions) {
+            // Translate v2-style $inlinecount to v4-style $count when needed
+            const normalizedOptions = { ...queryOptions };
+            if (odataVersion === 'v4' && normalizedOptions.$inlinecount) {
+                delete normalizedOptions.$inlinecount;
+                normalizedOptions.$count = 'true';
+            }
+
             const params = new URLSearchParams();
-            Object.entries(queryOptions).forEach(([key, value]) => {
+            Object.entries(normalizedOptions).forEach(([key, value]) => {
                 if (value !== undefined && value !== null) {
                     params.set(key, String(value));
                 }
